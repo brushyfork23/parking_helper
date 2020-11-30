@@ -22,13 +22,18 @@
 // Config
 //////////////////////////////////////////////
 // LED display
-const uint8_t NUM_LEDS = 10;
+const uint8_t NUM_LEDS = 20;
 const uint8_t LED_PIN = 6;
 const uint8_t FRAMES_PER_SECOND = 60;
 // Ultrasonic sensor
+const uint8_t INACTIVITY_SECONDS = 5;
+const uint16_t MIN_DISTANCE = 40; // distance in centimeters from sensor to parked bumper
+const uint16_t MAX_DISTANCE = 400;
+const uint8_t INFREQUENT_READS_PER_SECOND = 3;
+const uint8_t MAX_READS_PER_SECOND = 9;
 const uint8_t TRIGGER_PIN = 2;
 const uint8_t ECHO_PIN = 3;
-const uint16_t SWEET_SPOT = 31; // distance in centimeters from sensor to parked bumper
+
 
 
 ///////////////////////////////////////////////
@@ -36,7 +41,7 @@ const uint16_t SWEET_SPOT = 31; // distance in centimeters from sensor to parked
 ///////////////////////////////////////////////
 // State machine
 enum states {
-    AWAY_STATE      // Watching for a distance reading to appear.  Ping infrequently
+    AWAY_STATE,     // Watching for a distance reading to appear.  Ping infrequently
     PARKING_STATE,  // Light display to show parking distance.  Ping constantly.  Transition after inactivity timeout.
     PARKED_STATE,   // Watch for car to begin backing up.  Ping infrequently.  Transition after distance timeout.
 };
@@ -51,22 +56,19 @@ bool isTransitioning = true;
 #include <FastLED.h>
 CRGB leds[NUM_LEDS];
 LightChrono nextFrameTimer;
-uint8_t level = 0;
+unsigned long distance = 0;
 
 // Display colors
 DEFINE_GRADIENT_PALETTE( warning_gp ) {
   0,     0,  255,  0,   //green
-192,   255,  255,  0,   //bright yellow
+128,   255,  255,  0,   //bright yellow
+224,   255,  0,    0,   //red
 255,   255,  0,    0 }; //red
 CRGBPalette16 pallet = warning_gp;
 
 // Ultrasonic sensor
-const unsigned long timeoutMicros = 1000000UL;
-const uint8_t INACTIVITY_SECONDS = 5;
-const uint16_t MIN_DISTANCE = 2;
-const uint16_t MAX_DISTANCE = 400;
-const uint8_t INFREQUENT_READS_PER_SECOND = 2;
-const uint8_t MAX_READS_PER_SECOND = 10;
+const unsigned long timeoutMicros = 110000UL;
+uint16_t prevDistance = 0;
 LightChrono readTimer;
 LightChrono inactivityTimer;
 
@@ -107,7 +109,7 @@ void setup() {
     Serial.flush();
 
     // LEDs
-    FastLED.addLeds<WS2812B, LED_PIN, RGB>(leds, NUM_LEDS);
+    FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, NUM_LEDS);
     fill_solid(leds, NUM_LEDS, CRGB(0,0,0));
 
     // Ultrasonic sensor
@@ -165,25 +167,33 @@ void tickParking() {
 
     // Take frequent readings
     if(readTimer.hasPassed(1000UL / MAX_READS_PER_SECOND, true)) {
-        unsigned long distance = readDistance();
+        distance = readDistance();
 
-        Serial.print("Distance: ");
-        Serial.println(distance);
+//        Serial.print("Distance: ");
+//        Serial.println(distance);
 
-        if (distance > 0) {
-            inactivityTimer.reset();
-
-            if (distance <= SWEET_SPOT) {
-                level = 255;
-            } else {
-                level = map(distance, MIN_DISTANCE, MAX_DISTANCE, 255, 0);
-            }
+        if (abs(distance-prevDistance) >= 5) {
+            prevDistance = distance;
+            inactivityTimer.restart();
         }
     }
 
     // Draw the next frame
     if (nextFrameTimer.hasPassed(1000UL / FRAMES_PER_SECOND, true)) {
-        uint8_t litLeds = (NUM_LEDS/2) * level / 255;
+        // convert distance to number of leds
+        uint8_t litLeds = 0;
+        if (distance > 0 && distance < MAX_DISTANCE) {
+            distance = constrain(distance, MIN_DISTANCE, MAX_DISTANCE);
+//            Serial.print("Constrained Distance: ");
+//            Serial.println(distance);
+
+            litLeds = (NUM_LEDS/2) - (NUM_LEDS/2) * (distance-MIN_DISTANCE) / (MAX_DISTANCE-MIN_DISTANCE);
+        }
+
+//        Serial.print("Lit LEDs: ");
+//        Serial.println(litLeds);
+
+        fill_solid(leds, NUM_LEDS, CRGB(0,0,0));
         for(uint8_t i=0; i<litLeds; i++) {
             uint8_t colorIndex = 255 * i / (NUM_LEDS/2);
             CRGB color = ColorFromPalette( pallet, colorIndex );
@@ -207,17 +217,14 @@ void tickParked() {
         fill_solid(leds, NUM_LEDS, CRGB(0,0,0));
         FastLED.show();
 
-        readTimer.reset();
+        readTimer.restart();
     }
 
     // Take infrequent readings
     if(readTimer.hasPassed(1000UL / INFREQUENT_READS_PER_SECOND, true)) {
         unsigned long distance = readDistance();
 
-        Serial.print("Distance: ");
-        Serial.println(distance);
-
-        if (distance > 0) {
+        if (distance == 0 || distance > MAX_DISTANCE) {
             state = AWAY_STATE;
             isTransitioning = true;
         }
@@ -240,7 +247,7 @@ void tickAway() {
         Serial.print("Distance: ");
         Serial.println(distance);
 
-        if (distance > 0) {
+        if (distance > 0 && distance < MAX_DISTANCE) {
             state = PARKING_STATE;
             isTransitioning = true;
         }
