@@ -14,6 +14,8 @@
 /////////////////////////////////////////////
 // Required Libraries
 /////////////////////////////////////////////
+// AsyncSonarLib - https://github.com/luisllamasbinaburo/Arduino-AsyncSonar
+// YetAnotherArduinoPcIntLibrary - https://github.com/paulo-raca/YetAnotherArduinoPcIntLibrary/
 // FastLED - https://github.com/FastLED/FastLED
 // Chrono - https://github.com/SofaPirate/Chrono
 
@@ -22,18 +24,20 @@
 // Config
 //////////////////////////////////////////////
 // LED display
-const uint8_t NUM_LEDS = 20;
-const uint8_t LED_PIN = 6;
-const uint8_t FRAMES_PER_SECOND = 60;
+const uint8_t NUM_LEDS = 24;
+const uint8_t LED_PIN = 3;
 // Ultrasonic sensor
-const uint8_t INACTIVITY_SECONDS = 5;
-const uint16_t MIN_DISTANCE = 40; // distance in centimeters from sensor to parked bumper
-const uint16_t MAX_DISTANCE = 400;
-const uint8_t INFREQUENT_READS_PER_SECOND = 3;
-const uint8_t MAX_READS_PER_SECOND = 9;
 const uint8_t TRIGGER_PIN = 2;
-const uint8_t ECHO_PIN = 3;
+const uint16_t MIN_TRIGGER_DISTANCE = 4;
+const uint16_t MAX_TRIGGER_DISTANCE = 100;
+const uint8_t INACTIVITY_SECONDS = 5;
+const uint16_t MIN_DISPLAY_DISTANCE = 10; // distance in inches from sensor to parked bumper
+const uint16_t MAX_DISPLAY_DISTANCE = 80;
+const uint8_t FAST_TRIGGER_INTERVAL = 35;
+const uint8_t SLOW_TRIGGER_INTERVAL = 250;
 
+// #define DEBUG_DISTANCE
+// #define DEBUG_LEDS
 
 
 ///////////////////////////////////////////////
@@ -49,14 +53,11 @@ enum states state = AWAY_STATE;
 bool isTransitioning = true;
 
 // Timer
-#include <Chrono.h>
 #include <LightChrono.h>
 
 // LED display
 #include <FastLED.h>
 CRGB leds[NUM_LEDS];
-LightChrono nextFrameTimer;
-unsigned long distance = 0;
 
 // Display colors
 DEFINE_GRADIENT_PALETTE( warning_gp ) {
@@ -67,30 +68,41 @@ DEFINE_GRADIENT_PALETTE( warning_gp ) {
 CRGBPalette16 pallet = warning_gp;
 
 // Ultrasonic sensor
-const unsigned long timeoutMicros = 110000UL;
-uint16_t prevDistance = 0;
-LightChrono readTimer;
+#include "AsyncSonarLib.h"
 LightChrono inactivityTimer;
+unsigned int prevDistance = 0;
 
 
-/////////////////////////////////////
-// Utility Methods
-/////////////////////////////////////
-// Get ultrasonic sensor distance reading in centimeters.
-// Returns 0 if no distance found before sensor timeout.
-unsigned long readDistance() {
-    // Sets the trigger pin on HIGH state for 10 micro seconds
-    digitalWrite(TRIGGER_PIN, HIGH);
-    delayMicroseconds(10);
-    digitalWrite(TRIGGER_PIN, LOW);
-
-    // Reads the echo pin, returns the sound wave travel time in microseconds
-    unsigned long durationMicros = pulseIn(ECHO_PIN, HIGH, timeoutMicros);
-    // Calculating the distance in centimeters
-    unsigned long distanceCm= durationMicros*0.034/2;
-
-    return distanceCm;
+///////////////////////////////////////////////
+// Async Sonar callback methods
+///////////////////////////////////////////////
+void PingRecieved(AsyncSonar& sensor)
+{
+    switch (state) {
+        case PARKING_STATE:
+            parkingPingReceived(sensor);
+            break;
+        case PARKED_STATE:
+            parkedPingReceived(sensor);
+            break;
+        case AWAY_STATE:
+            awayPingReceived(sensor);
+            break;
+   }
 }
+
+void PingTimeout(AsyncSonar& sensor)
+{
+    switch (state) {
+        case PARKED_STATE:
+            Serial.println("Timed out")
+            state = AWAY_STATE;
+            isTransitioning = true;
+            break;
+   }
+}
+
+AsyncSonar sonar(TRIGGER_PIN, PingRecieved, PingTimeout);
 
 
 ////////////////////////////////////////
@@ -113,10 +125,7 @@ void setup() {
     fill_solid(leds, NUM_LEDS, CRGB(0,0,0));
 
     // Ultrasonic sensor
-    pinMode(TRIGGER_PIN, OUTPUT); // Sets the trigger pin as an Output
-    pinMode(ECHO_PIN, INPUT); // Sets the echo pin as an Input
-    digitalWrite(TRIGGER_PIN, LOW);  // Clear the trigger pin
-    delayMicroseconds(2);
+    sonar.Start(500); // start in 500ms
 
     Serial.println();
     Serial.println("Running...");
@@ -128,6 +137,8 @@ void setup() {
 // Loop
 /////////////////////////////////////
 void loop() {
+  sonar.Update(&sonar);
+
     switch (state) {
       case AWAY_STATE:
           tickAway();
@@ -146,6 +157,34 @@ void loop() {
 // State methods
 ///////////////////////////////////////
 
+// state: AWAY_STATE
+// Watching for a distance reading to appear.  Ping infrequently
+void tickAway() {
+  
+    if (isTransitioning) {
+        isTransitioning = false;
+        // Log the state transition
+        Serial.println("AWAY");
+        
+        sonar.SetTriggerInterval(SLOW_TRIGGER_INTERVAL);
+    }
+}
+
+void awayPingReceived(AsyncSonar& sensor) {
+    unsigned int distance = sensor.GetFilteredMM() * .03937; // in inches
+
+    #ifdef DEBUG_DISTANCE
+    Serial.print("Away: ");
+    Serial.print(distance);
+    Serial.println(" inches");
+    #endif
+    
+    if (distance > MIN_TRIGGER_DISTANCE && distance < MAX_TRIGGER_DISTANCE) {
+        state = PARKING_STATE;
+        isTransitioning = true;
+    }
+}
+
 // state: PARKING_STATE
 // Light display to show parking distance.  Ping constantly.  Transition after inactivity timeout.
 void tickParking() {
@@ -154,9 +193,9 @@ void tickParking() {
         // Log the state transition
         Serial.println("PARKING");
 
+        sonar.SetTriggerInterval(FAST_TRIGGER_INTERVAL);
+
         inactivityTimer.restart();
-        readTimer.restart();
-        nextFrameTimer.restart();
     }
 
     // After motion inactivity, transition to PARKED_STATE
@@ -164,44 +203,43 @@ void tickParking() {
         state = PARKED_STATE;
         isTransitioning = true;
     }
+}
 
-    // Take frequent readings
-    if(readTimer.hasPassed(1000UL / MAX_READS_PER_SECOND, true)) {
-        distance = readDistance();
+void parkingPingReceived(AsyncSonar& sensor) {
+    unsigned int distance = sensor.GetFilteredMM() * .03937; // in inches
 
-//        Serial.print("Distance: ");
-//        Serial.println(distance);
-
-        if (abs(distance-prevDistance) >= 5) {
-            prevDistance = distance;
-            inactivityTimer.restart();
-        }
+    #ifdef DEBUG_DISTANCE
+    Serial.print("Parking: ");
+    Serial.print(distance);
+    Serial.println(" inches");
+    #endif
+    
+    // ignore readings out of bounds
+    if (distance < MIN_TRIGGER_DISTANCE || distance > MAX_TRIGGER_DISTANCE) {
+        return;
     }
 
-    // Draw the next frame
-    if (nextFrameTimer.hasPassed(1000UL / FRAMES_PER_SECOND, true)) {
-        // convert distance to number of leds
-        uint8_t litLeds = 0;
-        if (distance > 0 && distance < MAX_DISTANCE) {
-            distance = constrain(distance, MIN_DISTANCE, MAX_DISTANCE);
-//            Serial.print("Constrained Distance: ");
-//            Serial.println(distance);
-
-            litLeds = (NUM_LEDS/2) - (NUM_LEDS/2) * (distance-MIN_DISTANCE) / (MAX_DISTANCE-MIN_DISTANCE);
-        }
-
-//        Serial.print("Lit LEDs: ");
-//        Serial.println(litLeds);
-
-        fill_solid(leds, NUM_LEDS, CRGB(0,0,0));
-        for(uint8_t i=0; i<litLeds; i++) {
-            uint8_t colorIndex = 255 * i / (NUM_LEDS/2);
-            CRGB color = ColorFromPalette( pallet, colorIndex );
-            leds[i] = color;
-            leds[NUM_LEDS-1-i] = color;
-        };
-        FastLED.show();
+    if (abs(distance-prevDistance) > 4) {
+        prevDistance = distance;
+        inactivityTimer.restart();
     }
+
+    // convert distance to number of leds
+    distance = constrain(distance, MIN_DISPLAY_DISTANCE, MAX_DISPLAY_DISTANCE);
+    uint8_t litLeds = (NUM_LEDS/2) - (NUM_LEDS/2) * (distance-MIN_DISPLAY_DISTANCE) / (MAX_DISPLAY_DISTANCE-MIN_DISPLAY_DISTANCE);
+
+    #ifdef DEBUG_LEDS
+    Serial.print("Lit LEDs: ");
+    Serial.println(litLeds);
+    #endif
+
+    for(uint8_t i=0; i<litLeds; i++) {
+        uint8_t colorIndex = 255 * i / (NUM_LEDS/2);
+        CRGB color = ColorFromPalette( pallet, colorIndex );
+        leds[i] = color;
+        leds[NUM_LEDS-1-i] = color;
+    };
+    FastLED.show();
 }
 
 // state: PARKED_STATE
@@ -213,43 +251,25 @@ void tickParked() {
         Serial.println("PARKED");
 
         // clear display
-        FastLED.delay(1000UL / FRAMES_PER_SECOND);
+        FastLED.delay(100);
         fill_solid(leds, NUM_LEDS, CRGB(0,0,0));
         FastLED.show();
 
-        readTimer.restart();
-    }
-
-    // Take infrequent readings
-    if(readTimer.hasPassed(1000UL / INFREQUENT_READS_PER_SECOND, true)) {
-        unsigned long distance = readDistance();
-
-        if (distance == 0 || distance > MAX_DISTANCE) {
-            state = AWAY_STATE;
-            isTransitioning = true;
-        }
+        sonar.SetTriggerInterval(SLOW_TRIGGER_INTERVAL);
     }
 }
 
-// state: AWAY_STATE
-// Watching for a distance reading to appear.  Ping infrequently
-void tickAway() {
-    if (isTransitioning) {
-        isTransitioning = false;
-        // Log the state transition
-        Serial.println("AWAY");
-    }
+void parkedPingReceived(AsyncSonar& sensor) {
+    unsigned int distance = sensor.GetFilteredMM() * .03937; // in inches
 
-    // Take infrequent readings
-    if(readTimer.hasPassed(1000UL / INFREQUENT_READS_PER_SECOND, true)) {
-        unsigned long distance = readDistance();
-
-        Serial.print("Distance: ");
-        Serial.println(distance);
-
-        if (distance > 0 && distance < MAX_DISTANCE) {
-            state = PARKING_STATE;
-            isTransitioning = true;
-        }
+    #ifdef DEBUG_DISTANCE
+    Serial.print("Parked: ");
+    Serial.print(distance);
+    Serial.println(" inches");
+    #endif
+    
+    if (distance > MAX_TRIGGER_DISTANCE) {
+        state = AWAY_STATE;
+        isTransitioning = true;
     }
 }
