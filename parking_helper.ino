@@ -10,6 +10,7 @@
 // Upload to: Arduino Uno.
 // LEDs: WS2812B
 // Ultrasonic sensor: HC-SR04
+// Capacitor: 1000 µF
 
 /////////////////////////////////////////////
 // Required Libraries
